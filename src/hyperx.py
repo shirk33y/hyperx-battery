@@ -19,6 +19,7 @@ import threading
 import signal
 import subprocess
 import os
+import json
 import warnings
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -186,6 +187,71 @@ def bootstrap(dev):
 
 def main():
     log_path = Path(__file__).with_name("hyperx_audio_debug.log")
+
+    # -------- Settings persistence --------
+    settings_path = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "HyperX Battery" / "settings.json"
+    STARTUP_LNK_NAME = "HyperX Battery.lnk"
+
+    def _startup_folder() -> Path:
+        startup = os.environ.get("APPDATA")
+        if startup:
+            return Path(startup) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        return Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+    def _has_startup_shortcut() -> bool:
+        return (_startup_folder() / STARTUP_LNK_NAME).exists()
+
+    def _set_startup(enabled: bool):
+        lnk = _startup_folder() / STARTUP_LNK_NAME
+        if enabled:
+            try:
+                # Find our exe: if frozen (PyInstaller), use sys.executable; else python + script
+                if getattr(sys, 'frozen', False):
+                    target = sys.executable
+                    args = ""
+                else:
+                    target = sys.executable
+                    args = f'"{Path(__file__).resolve()}"'
+                # Create .lnk via PowerShell (avoids COM dependency on WScript.Shell)
+                ps_cmd = (
+                    f'$ws = New-Object -ComObject WScript.Shell; '
+                    f'$s = $ws.CreateShortcut("{lnk}"); '
+                    f'$s.TargetPath = "{target}"; '
+                    f'$s.Arguments = \'{args}\'; '
+                    f'$s.WorkingDirectory = "{Path(target).parent}"; '
+                    f'$s.WindowStyle = 7; '
+                    f'$s.Save()'
+                )
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
+                               capture_output=True, timeout=10)
+            except Exception as e:
+                print(f"[settings] Failed to create startup shortcut: {e}", file=sys.stderr)
+        else:
+            try:
+                lnk.unlink(missing_ok=True)
+            except Exception as e:
+                print(f"[settings] Failed to remove startup shortcut: {e}", file=sys.stderr)
+
+    def load_settings() -> dict:
+        defaults = {"auto_switch_device": True, "autostart": _has_startup_shortcut()}
+        try:
+            if settings_path.exists():
+                with settings_path.open("r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                defaults.update(saved)
+        except Exception:
+            pass
+        return defaults
+
+    def save_settings(settings: dict):
+        try:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            with settings_path.open("w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            print(f"[settings] Failed to save: {e}", file=sys.stderr)
+
+    settings = load_settings()
 
     def ensure_com():
         try:
@@ -413,6 +479,8 @@ def main():
         return devices[0] if devices else None
 
     def audio_switch_to_headset():
+        if not settings.get("auto_switch_device", True):
+            return
         if state.get("auto_switched_to_headset"):
             return
         target = find_headset()
@@ -437,6 +505,8 @@ def main():
         update_state("auto_switched_to_headset", True)
 
     def audio_restore_previous():
+        if not settings.get("auto_switch_device", True):
+            return
         if not state.get("auto_switched_to_headset"):
             return
         prev = {"id": PREFERRED_RESTORE_ID, "name": "Speakers (Focusrite USB Audio)"}
@@ -634,9 +704,31 @@ def main():
         stop_flag["stop"] = True
         icon.stop()
 
+    def on_toggle_auto_switch(icon, item):
+        settings["auto_switch_device"] = not settings.get("auto_switch_device", True)
+        save_settings(settings)
+
+    def on_toggle_autostart(icon, item):
+        new_val = not settings.get("autostart", False)
+        settings["autostart"] = new_val
+        _set_startup(new_val)
+        save_settings(settings)
+
     def tray_loop():
         menu = pystray.Menu(
             pystray.MenuItem("HyperX Battery Indicator", lambda : None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Auto switch device",
+                on_toggle_auto_switch,
+                checked=lambda item: settings.get("auto_switch_device", True),
+            ),
+            pystray.MenuItem(
+                "Autostart",
+                on_toggle_autostart,
+                checked=lambda item: settings.get("autostart", False),
+            ),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         )
         image = make_icon(None, False, False, False)
