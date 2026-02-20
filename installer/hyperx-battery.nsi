@@ -22,23 +22,15 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 ShowInstDetails nevershow
 ShowUninstDetails nevershow
+AutoCloseWindow true
 BrandingText "${APP_NAME} v${APP_VERSION}"
 
 ; ---- MUI2 settings (minimal: progress bar + status) ----
 !define MUI_ICON "..\assets\hyperx.ico"
 !define MUI_UNICON "..\assets\hyperx.ico"
 
-; Skip welcome, license, directory, components pages — go straight to install
-!define MUI_ABORTWARNING
-
-; Install page only (progress bar with status text)
+; Skip all pages except install progress — auto-closes when done
 !insertmacro MUI_PAGE_INSTFILES
-
-; Finish page — offer to launch
-!define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "Start ${APP_NAME} now"
-!define MUI_FINISHPAGE_NOAUTOCLOSE
-!insertmacro MUI_PAGE_FINISH
 
 ; Uninstaller pages
 !insertmacro MUI_UNPAGE_INSTFILES
@@ -92,7 +84,8 @@ Section "Install"
     IntFmt $0 "0x%08X" $0
     WriteRegDWORD HKCU "${UNINSTALL_REG}" "EstimatedSize" $0
 
-    DetailPrint "Installation complete."
+    ; Launch the app after install
+    Exec '"$INSTDIR\${APP_EXE}"'
 SectionEnd
 
 ; ---- Uninstall section ----

@@ -223,7 +223,8 @@ def main():
                     f'$s.Save()'
                 )
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=10,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
             except Exception as e:
                 print(f"[settings] Failed to create startup shortcut: {e}", file=sys.stderr)
         else:
@@ -422,7 +423,8 @@ def main():
         tried = False
         for cid in candidate_ids:
             try:
-                res = subprocess.run([svv_path, "/SetDefault", cid, "all"], capture_output=True, text=True)
+                res = subprocess.run([svv_path, "/SetDefault", cid, "all"], capture_output=True, text=True,
+                                     creationflags=subprocess.CREATE_NO_WINDOW)
                 log_audio(f"svv id={cid} all rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
                 print(f"[audio] svv id all rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
                 tried = True
@@ -435,7 +437,8 @@ def main():
             return
         for role in ("0", "1", "2"):
             try:
-                res = subprocess.run([svv_path, "/SetDefault", name, role], capture_output=True, text=True)
+                res = subprocess.run([svv_path, "/SetDefault", name, role], capture_output=True, text=True,
+                                     creationflags=subprocess.CREATE_NO_WINDOW)
                 log_audio(f"svv role={role} rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
                 print(f"[audio] svv role={role} rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
             except Exception as ee:
