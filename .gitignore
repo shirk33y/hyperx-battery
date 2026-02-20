@@ -1,0 +1,25 @@
+# Build output
+dist/
+build/
+__pycache__/
+*.pyc
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# Logs
+*.log
+
+# NSIS output
+installer/*.exe
+!installer/*.nsi
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
