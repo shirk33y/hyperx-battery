@@ -1,17 +1,37 @@
 # HyperX Battery
 
-Windows system tray battery indicator for HyperX Cloud Flight wireless headset with automatic audio device switching.
+System tray battery indicator for HyperX Cloud Flight wireless headset (Windows + Linux).
 
 ## Features
 
 - **Battery monitoring** — reads battery level from the 2.4 GHz USB dongle via HID
 - **Tray icon** — color-coded vertical bar (green/orange/red) with charging indicator
-- **Low battery notifications** — Windows toast at 20% and 10%
-- **Auto audio switching** — switches default audio device to headset when connected, restores previous device (Focusrite) when disconnected
+- **Low battery notifications** — Windows toast or Linux `notify-send` at 20% and 10%
+- **Auto audio switching (Windows)** — switches default audio device to headset when connected, restores previous device (Focusrite) when disconnected
 - **Mute indicator** — red border on tray icon when mic is muted
 - **Fallback audio control** — uses [SoundVolumeCommandLine (svcl.exe)](https://www.nirsoft.net/utils/sound_volume_command_line.html) when COM-based switching fails
 
 ## Install
+
+### Linux (source)
+
+Prerequisites:
+- Python 3.11+
+- A desktop session with tray icon support
+- `notify-send` available (package `libnotify-bin` on Debian/Ubuntu)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python src/hyperx.py
+```
+
+Notes (Linux):
+- Audio auto-switching is currently Windows-only.
+- Autostart toggle writes/removes: `~/.config/autostart/hyperx-battery.desktop`
+
+### Windows (installer)
 
 Download the latest `hyperx-battery-setup.exe` from [Releases](https://github.com/shirk33y/hyperx-battery/releases) and run it.
 
@@ -22,7 +42,7 @@ The installer:
 - Adds entry to Add/Remove Programs
 - Supports silent install: `hyperx-battery-setup.exe /S`
 
-## Build from source
+## Build from source (Windows)
 
 ### Prerequisites
 

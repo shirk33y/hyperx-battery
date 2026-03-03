@@ -1,7 +1,7 @@
 hidapi
 pystray
 pillow
-pycaw
-comtypes
-win10toast
+pycaw; platform_system == "Windows"
+comtypes; platform_system == "Windows"
+win10toast; platform_system == "Windows"
 pyinstaller

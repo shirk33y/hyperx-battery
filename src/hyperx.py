@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 r"""
-HyperX Cloud Flight battery via 2.4 GHz dongle (HID), Windows.
+HyperX Cloud Flight battery via 2.4 GHz dongle (HID).
 
-Requires (Windows Python, not WSL):
-    pip install hidapi pystray pillow
+Works on Windows and Linux (desktop session).
 
-Run from PowerShell/cmd:
+Run:
     python hyperx.py
 
 Tray icon shows battery %, tooltips show status; right-click Quit exits.
@@ -23,16 +22,34 @@ import json
 import warnings
 from pathlib import Path
 from typing import Optional, List, Dict
-import comtypes
-from ctypes import HRESULT, POINTER, c_int, c_wchar_p
-from comtypes import CLSCTX_ALL
-from comtypes import GUID
-from comtypes import COMMETHOD
-from comtypes import BSTR
-from pycaw.utils import AudioUtilities
+
+IS_WINDOWS = sys.platform.startswith("win")
+
+# On Linux the pip-installed hidapi bundles libusb which can't open hidraw devices
+# without usbfs access. Force the system hidraw backend via LD_PRELOAD.
+if not IS_WINDOWS and "HYPERX_HIDRAW_PRELOADED" not in os.environ:
+    _hidraw_lib = "/usr/lib64/libhidapi-hidraw.so.0"
+    if not os.path.exists(_hidraw_lib):
+        _hidraw_lib = "/usr/lib/libhidapi-hidraw.so.0"
+    if os.path.exists(_hidraw_lib):
+        _preload = os.environ.get("LD_PRELOAD", "")
+        if _hidraw_lib not in _preload:
+            env = os.environ.copy()
+            env["LD_PRELOAD"] = (_hidraw_lib + ":" + _preload).strip(":")
+            env["HYPERX_HIDRAW_PRELOADED"] = "1"
+            os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+if IS_WINDOWS:
+    import comtypes
+    from ctypes import HRESULT, c_int, c_wchar_p
+    from comtypes import CLSCTX_ALL
+    from comtypes import GUID
+    from comtypes import COMMETHOD
+    from pycaw.utils import AudioUtilities
 
 # Silence noisy COMError warnings from pycaw device property reads
-warnings.filterwarnings("ignore", message="COMError attempting to get property", category=UserWarning)
+if IS_WINDOWS:
+    warnings.filterwarnings("ignore", message="COMError attempting to get property", category=UserWarning)
 
 import hid
 import pystray
@@ -189,19 +206,51 @@ def main():
     log_path = Path(__file__).with_name("hyperx_audio_debug.log")
 
     # -------- Settings persistence --------
-    settings_path = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "HyperX Battery" / "settings.json"
+    if IS_WINDOWS:
+        settings_path = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "HyperX Battery" / "settings.json"
+    else:
+        settings_path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "hyperx-battery" / "settings.json"
     STARTUP_LNK_NAME = "HyperX Battery.lnk"
 
     def _startup_folder() -> Path:
+        if not IS_WINDOWS:
+            return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart"
         startup = os.environ.get("APPDATA")
         if startup:
             return Path(startup) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
         return Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
     def _has_startup_shortcut() -> bool:
-        return (_startup_folder() / STARTUP_LNK_NAME).exists()
+        if IS_WINDOWS:
+            return (_startup_folder() / STARTUP_LNK_NAME).exists()
+        return (_startup_folder() / "hyperx-battery.desktop").exists()
 
     def _set_startup(enabled: bool):
+        if not IS_WINDOWS:
+            desktop_file = _startup_folder() / "hyperx-battery.desktop"
+            if enabled:
+                try:
+                    desktop_file.parent.mkdir(parents=True, exist_ok=True)
+                    exec_target = f'"{sys.executable}" "{Path(__file__).resolve()}"'
+                    desktop_file.write_text(
+                        "\n".join([
+                            "[Desktop Entry]",
+                            "Type=Application",
+                            "Name=HyperX Battery",
+                            f"Exec={exec_target}",
+                            "X-GNOME-Autostart-enabled=true",
+                        ]) + "\n",
+                        encoding="utf-8",
+                    )
+                except Exception as e:
+                    print(f"[settings] Failed to create autostart entry: {e}", file=sys.stderr)
+            else:
+                try:
+                    desktop_file.unlink(missing_ok=True)
+                except Exception as e:
+                    print(f"[settings] Failed to remove autostart entry: {e}", file=sys.stderr)
+            return
+
         lnk = _startup_folder() / STARTUP_LNK_NAME
         if enabled:
             try:
@@ -254,6 +303,8 @@ def main():
     settings = load_settings()
 
     def ensure_com():
+        if not IS_WINDOWS:
+            return
         try:
             comtypes.CoInitialize()
         except Exception:
@@ -278,9 +329,10 @@ def main():
         "last_notified": None,
         "connected": False,
         "last_seen": 0,
-        "previous_audio_device": {"id": "{0.0.0.00000000}.{96742d3a-654c-4a34-af9d-adea184110f7}", "name": "Speakers (Focusrite USB Audio)"},
+        "previous_audio_device": None,
         "auto_switched_to_headset": False,
     }
+    hid_error_log_ts = {"t": 0.0}
 
     last_power_ts = {"t": 0.0, "v": None}
 
@@ -318,19 +370,20 @@ def main():
         elif evt == "auto_switched_to_headset":
             state["auto_switched_to_headset"] = bool(value)
 
-    # -------- COM-based default audio switching (pycaw) --------
+    # -------- COM-based default audio switching (pycaw, Windows only) --------
 
     # IPolicyConfigVista (Vista+) minimal interface
-    class IPolicyConfig(comtypes.IUnknown):
-        _iid_ = GUID("{568b9108-44bf-40b4-9006-86afe5b5a620}")
-        _methods_ = [
-            COMMETHOD([], HRESULT, "SetDefaultEndpoint", (['in'], c_wchar_p, 'deviceId'), (['in'], c_int, 'role')),
-        ]
+    if IS_WINDOWS:
+        class IPolicyConfig(comtypes.IUnknown):
+            _iid_ = GUID("{568b9108-44bf-40b4-9006-86afe5b5a620}")
+            _methods_ = [
+                COMMETHOD([], HRESULT, "SetDefaultEndpoint", (['in'], c_wchar_p, 'deviceId'), (['in'], c_int, 'role')),
+            ]
 
-    POLICY_CONFIG_CLSID = GUID("{294935CE-F637-4E7C-A41B-AB255460B862}")
-    ERoleConsole = 0
-    ERoleMultimedia = 1
-    ERoleCommunications = 2
+        POLICY_CONFIG_CLSID = GUID("{294935CE-F637-4E7C-A41B-AB255460B862}")
+        ERoleConsole = 0
+        ERoleMultimedia = 1
+        ERoleCommunications = 2
 
     def _dev_id(dev) -> str:
         try:
@@ -341,7 +394,68 @@ def main():
             except Exception:
                 return ""
 
+    def _find_pactl() -> Optional[str]:
+        """Return path to pactl: local install, or host binary (toolbox/container)."""
+        import shutil
+        p = shutil.which("pactl")
+        if p:
+            return p
+        host = "/run/host/usr/bin/pactl"
+        if os.path.exists(host):
+            return host
+        return None
+
     def list_playback_devices() -> List[Dict[str, str]]:
+        if not IS_WINDOWS:
+            pactl = _find_pactl()
+            if pactl:
+                try:
+                    res = subprocess.run([pactl, "list", "short", "sinks"], capture_output=True, text=True)
+                    if res.returncode == 0:
+                        items: List[Dict[str, str]] = []
+                        for line in res.stdout.splitlines():
+                            parts = line.split("\t")
+                            if len(parts) < 2:
+                                continue
+                            sink_id = parts[0].strip()
+                            sink_name = parts[1].strip()
+                            if sink_name:
+                                items.append({"id": sink_name, "name": sink_name, "index": sink_id})
+                        if items:
+                            return items
+                except Exception:
+                    pass
+            # wpctl fallback (PipeWire native, available in toolbox)
+            try:
+                import shutil
+                wpctl = shutil.which("wpctl")
+                if wpctl:
+                    res = subprocess.run([wpctl, "status"], capture_output=True, text=True)
+                    if res.returncode == 0:
+                        items = []
+                        in_sinks = False
+                        for line in res.stdout.splitlines():
+                            if "Sinks:" in line:
+                                in_sinks = True
+                                continue
+                            if in_sinks:
+                                # stop at next section header
+                                if line.strip() and not line.strip().startswith("│") and not line.strip().startswith("*"):
+                                    break
+                                # match lines like: │      46. Name [vol: ...]
+                                #               or: │  *   64. Name [vol: ...]
+                                stripped = line.replace("│", "").replace("*", "").strip()
+                                import re as _re
+                                m = _re.match(r'^(\d+)\.\s+(.+?)\s*(\[.*\])?$', stripped)
+                                if m:
+                                    wid = m.group(1).strip()
+                                    name = m.group(2).strip()
+                                    items.append({"id": wid, "name": name, "wpctl_id": wid})
+                        if items:
+                            return items
+            except Exception:
+                pass
+            return []
         ensure_com()
         try:
             devices = AudioUtilities.GetAllDevices()
@@ -362,6 +476,40 @@ def main():
             return []
 
     def get_default_playback() -> Optional[Dict[str, str]]:
+        if not IS_WINDOWS:
+            pactl = _find_pactl()
+            if pactl:
+                try:
+                    res = subprocess.run([pactl, "get-default-sink"], capture_output=True, text=True)
+                    if res.returncode == 0:
+                        sink = res.stdout.strip()
+                        if sink:
+                            return {"id": sink, "name": sink}
+                except Exception:
+                    pass
+            # wpctl fallback: find the sink marked with * in wpctl status
+            try:
+                import shutil, re as _re
+                wpctl = shutil.which("wpctl")
+                if wpctl:
+                    res = subprocess.run([wpctl, "status"], capture_output=True, text=True)
+                    if res.returncode == 0:
+                        in_sinks = False
+                        for line in res.stdout.splitlines():
+                            if "Sinks:" in line:
+                                in_sinks = True
+                                continue
+                            if in_sinks:
+                                if line.strip() and not line.strip().startswith("│") and not line.strip().startswith("*"):
+                                    break
+                                if "*" in line:
+                                    stripped = line.replace("│", "").replace("*", "").strip()
+                                    m = _re.match(r'^(\d+)\.\s+(.+?)\s*(\[.*\])?$', stripped)
+                                    if m:
+                                        return {"id": m.group(1).strip(), "name": m.group(2).strip()}
+            except Exception:
+                pass
+            return None
         ensure_com()
         try:
             dev = AudioUtilities.GetDefaultAudioEndpoint(0, ERoleConsole)
@@ -376,6 +524,26 @@ def main():
     PREFERRED_RESTORE_ID = "{0.0.0.00000000}.{96742d3a-654c-4a34-af9d-adea184110f7}"  # Focusrite Speakers
 
     def set_default_playback(device_id: str, device_name: Optional[str] = None, use_preferred: bool = True):
+        if not IS_WINDOWS:
+            if not device_id:
+                return
+            import shutil
+            pactl = _find_pactl()
+            wpctl = shutil.which("wpctl")
+            # Try pactl first (PulseAudio/PipeWire), then wpctl for native PipeWire setups
+            for cmd in (
+                ([pactl, "set-default-sink", device_id] if pactl else None),
+                ([wpctl, "set-default", device_id] if wpctl else None),
+            ):
+                if not cmd:
+                    continue
+                try:
+                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    if res.returncode == 0:
+                        return
+                except Exception:
+                    pass
+            return
         ensure_com()
         if not device_id:
             log_audio("set_default_playback skipped: empty device_id")
@@ -493,8 +661,22 @@ def main():
         log_audio(f"target: {target}")
         print(f"[audio] devices={devices_list}")
         print(f"[audio] target={target}")
-        # Always remember Focusrite as previous (user preference)
-        update_state("previous_audio_device", {"id": PREFERRED_RESTORE_ID, "name": "Speakers (Focusrite USB Audio)"})
+        if IS_WINDOWS:
+            # Keep existing Windows preference behavior
+            update_state("previous_audio_device", {"id": PREFERRED_RESTORE_ID, "name": "Speakers (Focusrite USB Audio)"})
+        else:
+            current = get_default_playback()
+            current_id = (current or {}).get("id", "")
+            current_is_headset = any(
+                k in current_id.lower() for k in ("hyperx", "cloud", "kingston")
+            )
+            if current and not current_is_headset:
+                update_state("previous_audio_device", current)
+            else:
+                # Current default is already the headset (or unknown); find a non-headset fallback
+                fallback = find_non_headset()
+                if fallback and fallback.get("id") != target.get("id"):
+                    update_state("previous_audio_device", fallback)
         # Try primary target; if svcl fallback fails, try other HyperX render ids
         set_default_playback(target["id"], target.get("name"), use_preferred=True)
         # fallback attempts for other HyperX render devices
@@ -509,15 +691,26 @@ def main():
             return
         if not state.get("auto_switched_to_headset"):
             return
-        prev = {"id": PREFERRED_RESTORE_ID, "name": "Speakers (Focusrite USB Audio)"}
+        if IS_WINDOWS:
+            prev = {"id": PREFERRED_RESTORE_ID, "name": "Speakers (Focusrite USB Audio)"}
+        else:
+            prev = state.get("previous_audio_device")
+            if not prev or not prev.get("id"):
+                update_state("auto_switched_to_headset", False)
+                return
         log_audio(f"restore prev={prev}")
         print(f"[audio] restore to {prev}")
-        current = get_default_playback()
         # Allow force-restore even if user changed, since they asked automatic back
         set_default_playback(prev["id"], prev.get("name"), use_preferred=False)
         update_state("auto_switched_to_headset", False)
 
     stop_flag = {"stop": False}
+
+    def log_hid_open_issue_once_per_interval(msg: str, interval_s: float = 5.0):
+        now = time.time()
+        if now - hid_error_log_ts["t"] >= interval_s:
+            print(msg, file=sys.stderr)
+            hid_error_log_ts["t"] = now
 
     def hid_loop():
         while not stop_flag["stop"]:
@@ -531,10 +724,10 @@ def main():
                 time.sleep(1)
                 continue
 
-            # Tentative device name, but keep connected False until data arrives
+            # Tentative device name; preserve connected state across re-scans
+            # (do NOT force connected=False here — that causes spurious switch cycles)
             dev_name = devices[0].get("product_string") or "HyperX Cloud Flight"
             update_state("device", dev_name)
-            update_state("connected", False)
 
             bootstrap_info = pick_bootstrap_device(devices)
             if bootstrap_info:
@@ -543,7 +736,7 @@ def main():
                     bdev.open_path(bootstrap_info["path"])
                     bootstrap(bdev)
                 except Exception as e:
-                    print(f"Bootstrap failed: {e}", file=sys.stderr)
+                    log_hid_open_issue_once_per_interval(f"Bootstrap failed: {e}")
                 finally:
                     try:
                         bdev.close()
@@ -552,13 +745,51 @@ def main():
 
             handles: List[hid.device] = []
             try:
-                for info in devices:
-                    dev = hid.device()
-                    dev.open_path(info["path"])
-                    dev.set_nonblocking(False)
-                    handles.append(dev)
+                preferred_infos = [
+                    info
+                    for info in devices
+                    if info.get("usage_page") == STATUS_USAGE_PAGE and info.get("usage") == STATUS_USAGE
+                ]
+                open_candidates = preferred_infos if preferred_infos else devices
 
-                # do not set last_seen until data arrives
+                for info in open_candidates:
+                    try:
+                        dev = hid.device()
+                        dev.open_path(info["path"])
+                        dev.set_nonblocking(False)
+                        handles.append(dev)
+                    except Exception as e:
+                        log_hid_open_issue_once_per_interval(
+                            f"HID open failed for path={info.get('path')}: {e}"
+                        )
+
+                if not handles:
+                    # Linux fallback: some hidapi builds cannot open enumerate() paths
+                    # but can still open by VID/PID.
+                    if sys.platform.startswith("linux"):
+                        try:
+                            fdev = hid.device()
+                            fdev.open(VENDOR_ID, PRODUCT_ID)
+                            fdev.set_nonblocking(False)
+                            handles.append(fdev)
+                        except Exception as e:
+                            log_hid_open_issue_once_per_interval(
+                                f"HID fallback open(VID,PID) failed: {e}"
+                            )
+
+                if not handles:
+                    update_state("connected", False)
+                    if sys.platform.startswith("linux"):
+                        log_hid_open_issue_once_per_interval(
+                            "No accessible HyperX HID interfaces. Check udev permissions for vendor=0951 product=16c4, "
+                            "and if running inside toolbox/container/flatpak, ensure /dev/hidraw access is allowed."
+                        )
+                    time.sleep(1)
+                    continue
+
+                # Seed last_seen so the 10 s no-data timeout doesn't fire before
+                # the first battery report arrives (headset reports every ~10 s).
+                update_state("last_seen", time.time())
 
                 while not stop_flag["stop"]:
                     any_data = False
@@ -582,14 +813,21 @@ def main():
                                     audio_switch_to_headset()
                     if not any_data:
                         time.sleep(0.05)
-                        # if no data for 10s, mark disconnected and break to rescan
                         last_seen = state.get("last_seen") or 0
-                        if last_seen == 0:
-                            last_seen = state.get("last_seen") or 0
-                        if last_seen == 0 or time.time() - last_seen > 10:
-                            update_state("connected", False)
-                            audio_restore_previous()
-                            break
+                        if last_seen == 0 or time.time() - last_seen > 30:
+                            # No data for a while — only treat as disconnect if dongle is gone
+                            if not list_devices():
+                                update_state("connected", False)
+                                audio_restore_previous()
+                                break
+                            else:
+                                # Dongle still present; re-bootstrap to request a fresh report
+                                for dev in handles:
+                                    try:
+                                        dev.write(BOOTSTRAP_REPORT)
+                                    except Exception:
+                                        pass
+                                update_state("last_seen", time.time())
                     else:
                         time.sleep(0.01)
             finally:
@@ -677,13 +915,20 @@ def main():
         for th in thresholds:
             if level <= th and (last is None or level <= th < last):
                 try:
-                    from win10toast import ToastNotifier
-                    ToastNotifier().show_toast(
-                        "HyperX Battery",
-                        f"Battery low: {level}%",
-                        duration=5,
-                        threaded=True,
-                    )
+                    if IS_WINDOWS:
+                        from win10toast import ToastNotifier
+                        ToastNotifier().show_toast(
+                            "HyperX Battery",
+                            f"Battery low: {level}%",
+                            duration=5,
+                            threaded=True,
+                        )
+                    else:
+                        subprocess.Popen([
+                            "notify-send",
+                            "HyperX Battery",
+                            f"Battery low: {level}%",
+                        ])
                 except Exception:
                     pass
                 state["last_notified"] = level
@@ -714,9 +959,24 @@ def main():
         _set_startup(new_val)
         save_settings(settings)
 
+    def battery_label(item):
+        b = state.get("battery")
+        charging = state.get("charging", False)
+        connected = state.get("connected", False)
+        if charging and b is not None:
+            return f"Charging: {b}%"
+        elif b is not None:
+            return f"Battery: {b}%"
+        elif charging:
+            return "Battery: Charging"
+        elif not connected:
+            return "Battery: Offline"
+        return "Battery: Unknown"
+
     def tray_loop():
         menu = pystray.Menu(
-            pystray.MenuItem("HyperX Battery Indicator", lambda : None, enabled=False),
+            pystray.MenuItem("HyperX Battery Indicator", lambda: None, enabled=False),
+            pystray.MenuItem(battery_label, lambda: None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Auto switch device",
@@ -737,10 +997,6 @@ def main():
         # periodic refresh based on state
         def updater():
             while not stop_flag["stop"]:
-                # Mark disconnected if no data for 10s
-                last_seen = state.get("last_seen") or 0
-                if last_seen and (time.time() - last_seen > 10):
-                    state["connected"] = False
                 refresh_icon(icon)
                 time.sleep(1)
         threading.Thread(target=updater, daemon=True).start()
