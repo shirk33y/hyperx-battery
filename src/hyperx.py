@@ -991,8 +991,18 @@ def main():
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         )
+
         image = make_icon(None, False, False, False)
-        icon = pystray.Icon("hyperx_battery", image, "HyperX Battery", menu)
+
+        def on_hover(icon_item, event):
+            # Show tooltip as notification on hover (works on GNOME/Bazzite)
+            try:
+                icon.notify(tooltip_text(), "HyperX Battery")
+            except Exception:
+                pass  # Notifications may not be available
+
+        icon = pystray.Icon("hyperx_battery", image, "HyperX Battery", menu,
+                            on_hover=on_hover)
         icon_ref["icon"] = icon
         # periodic refresh based on state
         def updater():
