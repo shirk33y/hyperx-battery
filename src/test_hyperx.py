@@ -1,10 +1,16 @@
 """Tests for hyperx.py — regression, fix verification, and pure-function unit tests."""
 
 import os
+import sys
 import time
 
 # CRITICAL: Must set env var BEFORE import to avoid os.execve() on Linux
 os.environ["HYPERX_HIDRAW_PRELOADED"] = "1"
+
+# Mock pystray before import — pystray requires X11 display which isn't available in CI
+# (GitHub Actions ubuntu-latest has no display server)
+sys.modules["pystray"] = type(sys)("pystray")
+sys.modules["pystray"].Icon = object
 
 import hyperx  # noqa: E402
 
