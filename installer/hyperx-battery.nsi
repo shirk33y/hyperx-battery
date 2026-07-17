@@ -19,7 +19,7 @@ Name "${APP_NAME}"
 OutFile "hyperx-battery-setup.exe"
 InstallDir "${INSTALL_DIR}"
 RequestExecutionLevel user
-SetCompressor /SOLID lzma
+SetCompress off
 ShowInstDetails nevershow
 ShowUninstDetails nevershow
 AutoCloseWindow true
@@ -42,6 +42,18 @@ Section "Install"
     ; Kill running instance if any
     DetailPrint "Stopping running instances..."
     nsExec::ExecToLog 'taskkill /F /IM "${APP_EXE}" /T'
+    
+    ; Wait for process to fully terminate (retry up to 10 times, 500ms each)
+    StrCpy $0 0
+    retry_kill:
+        IntOp $0 $0 + 1
+        IntCmp $0 10 done_kill done_kill
+        Sleep 500
+        ClearErrors
+        FileOpen $1 "$INSTDIR\${APP_EXE}" w
+        IfErrors retry_kill
+        FileClose $1
+    done_kill:
 
     ; Install files
     SetOutPath "$INSTDIR"

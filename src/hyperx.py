@@ -20,15 +20,14 @@ import signal
 import subprocess
 import os
 import json
+import csv
+import io
+import logging
+import logging.handlers
 import warnings
 from pathlib import Path
 from typing import Optional, List, Dict
 import comtypes
-from ctypes import HRESULT, POINTER, c_int, c_wchar_p
-from comtypes import CLSCTX_ALL
-from comtypes import GUID
-from comtypes import COMMETHOD
-from comtypes import BSTR
 from pycaw.utils import AudioUtilities
 
 # Silence noisy COMError warnings from pycaw device property reads
@@ -137,6 +136,10 @@ def calc_percentage(charge_state: int, magic: int) -> Optional[int]:
     return None
 
 
+# Track last reported state to suppress duplicate log lines
+_last_report = {"battery": None, "charging": None, "power": None, "muted": None}
+
+
 def handle_report(data: bytes):
     ln = len(data)
     if ln == 0:
@@ -144,16 +147,24 @@ def handle_report(data: bytes):
 
     if ln == 0x02:
         if data[0] == 0x64 and data[1] == 0x03:
-            print("Power: off")
+            if _last_report["power"] != "off":
+                _last_report["power"] = "off"
+                print("Power: off")
             return ("power", "off")
         if data[0] == 0x64 and data[1] == 0x01:
-            print("Power: on")
+            if _last_report["power"] != "on":
+                _last_report["power"] = "on"
+                print("Power: on")
             return ("power", "on")
         if data[0] == 0x65 and data[1] == 0x04:
-            print("Muted: True")
+            if _last_report["muted"] is not True:
+                _last_report["muted"] = True
+                print("Muted: True")
             return ("muted", True)
         if data[0] == 0x65:
-            print("Muted: False")
+            if _last_report["muted"] is not False:
+                _last_report["muted"] = False
+                print("Muted: False")
             return ("muted", False)
 
     elif ln == 0x05:
@@ -169,7 +180,10 @@ def handle_report(data: bytes):
         pct = calc_percentage(charge_state, magic_value)
         charging_flag = charge_state == 0x10
         if pct is not None:
-            print(f"Battery: {pct}% (charge_state=0x{charge_state:02x}, magic={magic_value}, charging={charging_flag})")
+            if _last_report["battery"] != pct or _last_report["charging"] != charging_flag:
+                _last_report["battery"] = pct
+                _last_report["charging"] = charging_flag
+                print(f"Battery: {pct}% (charge_state=0x{charge_state:02x}, magic={magic_value}, charging={charging_flag})")
             return ("battery", (pct, charging_flag))
         return None
 
@@ -186,7 +200,18 @@ def bootstrap(dev):
 
 
 def main():
-    log_path = Path(__file__).with_name("hyperx_audio_debug.log")
+    # -------- File logging (rotating, capped at 2 MB) --------
+    log_dir = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "HyperX Battery"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "hyperx.log"
+    file_logger = logging.getLogger("hyperx")
+    file_logger.setLevel(logging.DEBUG)
+    _handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8",
+    )
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    file_logger.addHandler(_handler)
+    file_logger.info("=== hyperx-battery started ===")
 
     # -------- Settings persistence --------
     settings_path = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "HyperX Battery" / "settings.json"
@@ -263,10 +288,8 @@ def main():
     ensure_com()
 
     def log_audio(msg: str):
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(f"[{ts}] {msg}\n")
+            file_logger.info(msg)
         except Exception:
             pass
 
@@ -279,9 +302,18 @@ def main():
         "last_notified": None,
         "connected": False,
         "last_seen": 0,
-        "previous_audio_device": {"id": "{0.0.0.00000000}.{96742d3a-654c-4a34-af9d-adea184110f7}", "name": "Speakers (Focusrite USB Audio)"},
+        "previous_audio_device": None,
         "auto_switched_to_headset": False,
+        "power_off_at": 0.0,
+        "disconnect_at": 0.0,
     }
+
+    # Restore persisted previous_audio_device into state (skip if it's the headset itself)
+    _prev = settings.get("previous_audio_device")
+    if _prev and _prev.get("id"):
+        _prev_low = (_prev.get("name", "") + " " + _prev.get("id", "")).lower()
+        if "hyperx" not in _prev_low and "cloud" not in _prev_low:
+            state["previous_audio_device"] = _prev
 
     last_power_ts = {"t": 0.0, "v": None}
 
@@ -319,19 +351,9 @@ def main():
         elif evt == "auto_switched_to_headset":
             state["auto_switched_to_headset"] = bool(value)
 
-    # -------- COM-based default audio switching (pycaw) --------
+    # -------- Audio device helpers (pycaw for enumeration, svcl.exe for switching) --------
 
-    # IPolicyConfigVista (Vista+) minimal interface
-    class IPolicyConfig(comtypes.IUnknown):
-        _iid_ = GUID("{568b9108-44bf-40b4-9006-86afe5b5a620}")
-        _methods_ = [
-            COMMETHOD([], HRESULT, "SetDefaultEndpoint", (['in'], c_wchar_p, 'deviceId'), (['in'], c_int, 'role')),
-        ]
-
-    POLICY_CONFIG_CLSID = GUID("{294935CE-F637-4E7C-A41B-AB255460B862}")
     ERoleConsole = 0
-    ERoleMultimedia = 1
-    ERoleCommunications = 2
 
     def _dev_id(dev) -> str:
         try:
@@ -373,77 +395,90 @@ def main():
             log_audio(f"get_default_playback error: {e}")
             return None
 
-    PREFERRED_SVCL_ID = "{0.0.0.00000000}.{3d3538fa-ebc7-4288-8a22-69971084d2d9}"
-    PREFERRED_RESTORE_ID = "{0.0.0.00000000}.{96742d3a-654c-4a34-af9d-adea184110f7}"  # Focusrite Speakers
+    def _find_svcl() -> Optional[str]:
+        svv_path = os.environ.get("SOUNDVOLUMEVIEW_EXE")
+        if svv_path:
+            return svv_path
+        # When frozen (PyInstaller onefile), svcl.exe is extracted to _MEIPASS
+        if getattr(sys, 'frozen', False):
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                cand = Path(meipass) / "svcl.exe"
+                if cand.exists():
+                    return str(cand)
+            # Also check next to the exe itself
+            cand = Path(sys.executable).with_name("svcl.exe")
+            if cand.exists():
+                return str(cand)
+        # Dev mode: check next to the script
+        cand = Path(__file__).with_name("svcl.exe")
+        if cand.exists():
+            return str(cand)
+        # Check in tools/ relative to repo root
+        cand = Path(__file__).resolve().parent.parent / "tools" / "svcl.exe"
+        if cand.exists():
+            return str(cand)
+        return None
 
-    def set_default_playback(device_id: str, device_name: Optional[str] = None, use_preferred: bool = True):
-        ensure_com()
+    def set_default_playback(device_id: str, device_name: Optional[str] = None):
         if not device_id:
             log_audio("set_default_playback skipped: empty device_id")
             return
+        svv_path = _find_svcl()
+        if not svv_path:
+            log_audio("svcl.exe not found; cannot switch audio device")
+            print("[audio] svcl.exe not found; cannot switch audio device")
+            return
         try:
-            pc = comtypes.CoCreateInstance(POLICY_CONFIG_CLSID, IPolicyConfig, clsctx=CLSCTX_ALL)
-            ok = True
-            for role in (ERoleConsole, ERoleMultimedia, ERoleCommunications):
-                hr = pc.SetDefaultEndpoint(device_id, role)
-                if hr != 0:
-                    ok = False
-                    log_audio(f"SetDefaultEndpoint hr={hr} role={role}")
-                    print(f"[audio] SetDefaultEndpoint hr={hr} role={role}")
-                else:
-                    log_audio(f"SetDefaultEndpoint ok role={role} id={device_id}")
-                    print(f"[audio] SetDefaultEndpoint ok role={role} id={device_id}")
-            if ok:
-                return
+            res = subprocess.run([svv_path, "/SetDefault", device_id, "all"], capture_output=True, text=True,
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+            log_audio(f"svcl id={device_id} all rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
+            print(f"[audio] svcl id={device_id} all rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
         except Exception as e:
-            log_audio(f"set_default_playback error: {e}")
-            print(f"[audio] set_default_playback error: {e}", file=sys.stderr)
+            log_audio(f"svcl error: {e}")
+            print(f"[audio] svcl error: {e}", file=sys.stderr)
 
-        # Fallback: SoundVolumeView CLI (if available)
-        svv_path = os.environ.get("SOUNDVOLUMEVIEW_EXE")
-        if not svv_path:
-            cand1 = Path(__file__).with_name("SoundVolumeView.exe")
-            cand2 = Path(__file__).with_name("svcl.exe")
-            if cand1.exists():
-                svv_path = str(cand1)
-            elif cand2.exists():
-                svv_path = str(cand2)
-        if not svv_path:
-            log_audio("SoundVolumeView.exe not found; cannot fallback")
-            print("[audio] svcl/SoundVolumeView not found; skipping fallback")
-            return
-        name = device_name or ""
-        # If we have a device_id, svcl supports /SetDefault <id> all
-        # try preferred id first (known working) only when requested
-        candidate_ids = []
-        if use_preferred and PREFERRED_SVCL_ID:
-            candidate_ids.append(PREFERRED_SVCL_ID)
-        if device_id and device_id not in candidate_ids:
-            candidate_ids.append(device_id)
-        tried = False
-        for cid in candidate_ids:
-            try:
-                res = subprocess.run([svv_path, "/SetDefault", cid, "all"], capture_output=True, text=True,
-                                     creationflags=subprocess.CREATE_NO_WINDOW)
-                log_audio(f"svv id={cid} all rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
-                print(f"[audio] svv id all rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
-                tried = True
-                if res.returncode == 0:
-                    return
-            except Exception as ee:
-                log_audio(f"svv error id={cid}: {ee}")
-                print(f"[audio] svv error id={cid}: {ee}")
-        if tried:
-            return
-        for role in ("0", "1", "2"):
-            try:
-                res = subprocess.run([svv_path, "/SetDefault", name, role], capture_output=True, text=True,
-                                     creationflags=subprocess.CREATE_NO_WINDOW)
-                log_audio(f"svv role={role} rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
-                print(f"[audio] svv role={role} rc={res.returncode} out={res.stdout.strip()} err={res.stderr.strip()}")
-            except Exception as ee:
-                log_audio(f"svv error role={role}: {ee}")
-                print(f"[audio] svv error role={role}: {ee}")
+    def svcl_get_default_render() -> Optional[Dict[str, str]]:
+        """Use svcl.exe /scomma with /Columns to find the current default render device."""
+        svcl_path = _find_svcl()
+        if not svcl_path:
+            log_audio("svcl_get_default_render: svcl.exe not found")
+            return None
+        try:
+            # Request exactly the columns we need in a known order:
+            # 0=Name, 1=Type, 2=Direction, 3=Default, 4=Item ID, 5=Command-Line Friendly ID
+            res = subprocess.run(
+                [svcl_path, "/scomma", "",
+                 "/Columns", "Name,Type,Direction,Default,Item ID,Command-Line Friendly ID"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if res.returncode != 0:
+                log_audio(f"svcl /scomma failed rc={res.returncode} err={res.stderr.strip()}")
+                return None
+            raw = res.stdout.strip()
+            if not raw:
+                log_audio("svcl /scomma returned empty output")
+                return None
+            reader = csv.reader(io.StringIO(raw))
+            for row in reader:
+                if len(row) < 4:
+                    continue
+                name = row[0].strip()
+                item_type = row[1].strip() if len(row) > 1 else ""
+                direction = row[2].strip() if len(row) > 2 else ""
+                default_field = row[3].strip() if len(row) > 3 else ""
+                item_id = row[4].strip() if len(row) > 4 else ""
+                cli_id = row[5].strip() if len(row) > 5 else ""
+                # Default field contains "Render" when it's the default render device
+                if item_type == "Device" and direction == "Render" and "Render" in default_field:
+                    device_id = cli_id or item_id
+                    log_audio(f"svcl default render: name={name} id={device_id}")
+                    return {"id": device_id, "name": name}
+            log_audio("svcl: no default render device found in output")
+        except Exception as e:
+            log_audio(f"svcl_get_default_render error: {e}")
+        return None
 
     def find_headset() -> Optional[Dict[str, str]]:
         # Prefer exact known name, then substring, else first render device
@@ -468,64 +503,106 @@ def main():
             return hyperx_candidates[0]
         return devices[0] if devices else None
 
-    def find_non_headset() -> Optional[Dict[str, str]]:
-        devices = list_playback_devices()
-        # Prefer Focusrite
-        for item in devices:
-            name = (item.get("name") or "").lower()
-            if "focusrite" in name:
-                return item
-        for item in devices:
-            name = (item.get("name") or "").lower()
-            if "hyperx" not in name and "cloud" not in name:
-                return item
-        return devices[0] if devices else None
+    POWER_OFF_COOLDOWN = 30  # seconds to ignore reconnect after power-off
+    DISCONNECT_DEBOUNCE = 5   # seconds: brief HID dropouts don't trigger audio restore
 
     def audio_switch_to_headset():
         if not settings.get("auto_switch_device", True):
             return
         if state.get("auto_switched_to_headset"):
             return
+        # Suppress ghost reconnections shortly after power-off
+        power_off_at = state.get("power_off_at", 0.0)
+        if power_off_at and (time.time() - power_off_at) < POWER_OFF_COOLDOWN:
+            log_audio(f"ignoring reconnect {time.time() - power_off_at:.1f}s after power-off (cooldown {POWER_OFF_COOLDOWN}s)")
+            return
         target = find_headset()
         if not target:
             log_audio("headset not found among playback devices")
             print("[audio] headset not found among playback devices")
             return
-        devices_list = list_playback_devices()
-        log_audio(f"devices: {devices_list}")
-        log_audio(f"target: {target}")
-        print(f"[audio] devices={devices_list}")
-        print(f"[audio] target={target}")
-        # Always remember Focusrite as previous (user preference)
-        update_state("previous_audio_device", {"id": PREFERRED_RESTORE_ID, "name": "Speakers (Focusrite USB Audio)"})
-        # Try primary target; if svcl fallback fails, try other HyperX render ids
-        set_default_playback(target["id"], target.get("name"), use_preferred=True)
-        # fallback attempts for other HyperX render devices
-        hyperx_ids = [d["id"] for d in devices_list if "hyperx" in (d["name"].lower())]
-        for hid in hyperx_ids:
-            if hid != target["id"]:
-                set_default_playback(hid, target.get("name"))
+        # Store current default device before switching (use svcl for consistent ID format)
+        current = svcl_get_default_render()
+        if not current:
+            current = get_default_playback()
+        if current and current.get("id") != target.get("id") and not _is_hyperx(current.get("name", ""), current.get("id", "")):
+            update_state("previous_audio_device", current)
+            settings["previous_audio_device"] = current
+            save_settings(settings)
+            log_audio(f"stored previous device: {current}")
+            print(f"[audio] stored previous device: {current}")
+        log_audio(f"switching to headset: {target}")
+        print(f"[audio] switching to headset: {target}")
+        set_default_playback(target["id"], target.get("name"))
         update_state("auto_switched_to_headset", True)
+        prev_name = (current.get("name") if current else None) or "unknown"
+        _notify("HyperX Battery", f"Switched audio to {target.get('name', 'headset')}\nPrevious: {prev_name}")
 
-    def audio_restore_previous():
+    def audio_restore_previous(force: bool = False):
         if not settings.get("auto_switch_device", True):
             return
         if not state.get("auto_switched_to_headset"):
             return
-        prev = {"id": PREFERRED_RESTORE_ID, "name": "Speakers (Focusrite USB Audio)"}
-        log_audio(f"restore prev={prev}")
-        print(f"[audio] restore to {prev}")
-        current = get_default_playback()
-        # Allow force-restore even if user changed, since they asked automatic back
-        set_default_playback(prev["id"], prev.get("name"), use_preferred=False)
+        # Debounce: skip unless forced (explicit power-off) or sustained disconnect
+        if not force:
+            disc_at = state.get("disconnect_at", 0.0)
+            if not disc_at:
+                return
+            elapsed = time.time() - disc_at
+            if elapsed < DISCONNECT_DEBOUNCE:
+                log_audio(f"restore debounced: only {elapsed:.1f}s since disconnect (need {DISCONNECT_DEBOUNCE}s)")
+                return
+        prev = state.get("previous_audio_device")
+        if not prev or not prev.get("id"):
+            log_audio("no previous device stored; skipping restore")
+            print("[audio] no previous device stored; skipping restore")
+            update_state("auto_switched_to_headset", False)
+            return
+        log_audio(f"restoring to: {prev}")
+        print(f"[audio] restoring to: {prev}")
+        set_default_playback(prev["id"], prev.get("name"))
         update_state("auto_switched_to_headset", False)
+        state["disconnect_at"] = 0.0
+        _notify("HyperX Battery", f"Restored audio to {prev.get('name', 'previous device')}")
+
+    def _notify(title: str, msg: str, duration: int = 3):
+        try:
+            icon = icon_ref.get("icon")
+            if icon:
+                icon.notify(msg, title)
+        except Exception as e:
+            log_audio(f"notify exception: {e}")
 
     stop_flag = {"stop": False}
+
+    def _is_hyperx(name: str, device_id: str = "") -> bool:
+        low = (name or "").lower()
+        low_id = (device_id or "").lower()
+        return "hyperx" in low or "cloud" in low or "hyperx" in low_id or "cloud" in low_id
+
+    def poll_default_device():
+        while not stop_flag["stop"]:
+            try:
+                current = svcl_get_default_render()
+                if current and current.get("id") and not _is_hyperx(current.get("name", ""), current.get("id", "")):
+                    prev = state.get("previous_audio_device")
+                    if not prev or prev.get("id") != current.get("id"):
+                        update_state("previous_audio_device", current)
+                        # Persist to settings so it survives relaunch
+                        settings["previous_audio_device"] = current
+                        save_settings(settings)
+                        log_audio(f"poll: stored previous device: {current}")
+            except Exception as e:
+                log_audio(f"poll_default_device error: {e}")
+            time.sleep(10)
 
     def hid_loop():
         while not stop_flag["stop"]:
             devices = list_devices()
             if not devices:
+                if state.get("connected"):
+                    state["disconnect_at"] = state.get("disconnect_at") or time.time()
+                    log_audio("HID device gone — dongle disconnected")
                 update_state("connected", False)
                 update_state("device", "")
                 update_state("battery", (None, None))
@@ -574,22 +651,32 @@ def main():
                             if isinstance(evt, tuple):
                                 update_state(evt[0], evt[1])
                                 if evt[0] == "power" and evt[1] == "off":
+                                    state["power_off_at"] = time.time()
+                                    state["disconnect_at"] = time.time()
+                                    log_audio("explicit power-off received")
                                     update_state("connected", False)
                                     update_state("last_seen", 0)
-                                    audio_restore_previous()
+                                    audio_restore_previous(force=True)
                                     any_data = True
                                     break
+                                if evt[0] == "power" and evt[1] == "on":
+                                    state["power_off_at"] = 0.0
+                                    state["disconnect_at"] = 0.0
+                                    log_audio("explicit power-on received")
                                 update_state("connected", True)
                                 update_state("last_seen", time.time())
                                 if not was_connected and state.get("connected"):
+                                    state["disconnect_at"] = 0.0
+                                    log_audio("headset reconnected")
                                     audio_switch_to_headset()
                     if not any_data:
                         time.sleep(0.05)
-                        # if no data for 10s, mark disconnected and break to rescan
-                        last_seen = state.get("last_seen") or 0
-                        if last_seen == 0:
-                            last_seen = state.get("last_seen") or 0
-                        if last_seen == 0 or time.time() - last_seen > 10:
+                        # Periodically re-check if HID device is still present
+                        # (don't disconnect just because no data — headset only reports on state changes)
+                        if not list_devices():
+                            if state.get("connected"):
+                                state["disconnect_at"] = state.get("disconnect_at") or time.time()
+                                log_audio("HID device gone during read loop")
                             update_state("connected", False)
                             audio_restore_previous()
                             break
@@ -679,16 +766,7 @@ def main():
         thresholds = [20, 10]
         for th in thresholds:
             if level <= th and (last is None or level <= th < last):
-                try:
-                    from win10toast import ToastNotifier
-                    ToastNotifier().show_toast(
-                        "HyperX Battery",
-                        f"Battery low: {level}%",
-                        duration=5,
-                        threaded=True,
-                    )
-                except Exception:
-                    pass
+                _notify("HyperX Battery", f"Battery low: {level}%", duration=5)
                 state["last_notified"] = level
                 break
 
@@ -706,20 +784,41 @@ def main():
     def on_quit(icon, _item):
         stop_flag["stop"] = True
         icon.stop()
+        return 0
 
     def on_toggle_auto_switch(icon, item):
         settings["auto_switch_device"] = not settings.get("auto_switch_device", True)
         save_settings(settings)
+        return 0
 
     def on_toggle_autostart(icon, item):
         new_val = not settings.get("autostart", False)
         settings["autostart"] = new_val
         _set_startup(new_val)
         save_settings(settings)
+        return 0
+
+    def on_open_logs(icon, _item):
+        os.startfile(str(log_path))
+        return 0
+
+    def on_open_settings(icon, _item):
+        os.startfile(str(settings_path))
+        return 0
+
+    def _prev_device_label(_item=None) -> str:
+        prev = state.get("previous_audio_device")
+        if prev and prev.get("name"):
+            return f"  Prev: {prev['name']}"
+        return "  Prev: (none)"
 
     def tray_loop():
+        # Use _noop that returns 0 to avoid WNDPROC/LRESULT and WPARAM warnings
+        def _noop(*_args, **_kwargs):
+            return 0
+
         menu = pystray.Menu(
-            pystray.MenuItem("HyperX Battery Indicator", lambda : None, enabled=False),
+            pystray.MenuItem("HyperX Battery Indicator", _noop, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Auto switch device",
@@ -727,10 +826,18 @@ def main():
                 checked=lambda item: settings.get("auto_switch_device", True),
             ),
             pystray.MenuItem(
+                _prev_device_label,
+                _noop,
+                enabled=False,
+            ),
+            pystray.MenuItem(
                 "Autostart",
                 on_toggle_autostart,
                 checked=lambda item: settings.get("autostart", False),
             ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open logs", on_open_logs),
+            pystray.MenuItem("Open settings", on_open_settings),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         )
@@ -740,10 +847,6 @@ def main():
         # periodic refresh based on state
         def updater():
             while not stop_flag["stop"]:
-                # Mark disconnected if no data for 10s
-                last_seen = state.get("last_seen") or 0
-                if last_seen and (time.time() - last_seen > 10):
-                    state["connected"] = False
                 refresh_icon(icon)
                 time.sleep(1)
         threading.Thread(target=updater, daemon=True).start()
@@ -763,6 +866,9 @@ def main():
     # start HID reader thread
     t = threading.Thread(target=hid_loop, daemon=True)
     t.start()
+
+    # start default device poller thread
+    threading.Thread(target=poll_default_device, daemon=True).start()
 
     def handle_signal(_sig, _frame):
         stop_flag["stop"] = True

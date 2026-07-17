@@ -3,5 +3,4 @@ pystray
 pillow
 pycaw
 comtypes
-win10toast
 pyinstaller
