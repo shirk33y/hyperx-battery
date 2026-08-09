@@ -1,3 +1,5 @@
+<!-- project-index-summary: HyperX Cloud Flight battery indicator tray app for Windows with automatic audio device switching -->
+
 # HyperX Battery
 
 System tray battery indicator for HyperX Cloud Flight wireless headset (Windows + Linux).
